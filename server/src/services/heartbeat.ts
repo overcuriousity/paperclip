@@ -43,6 +43,7 @@ import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiCon
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { isParkedReassignmentHandoff, reassignmentHandoffWakeup } from "./reassignment-handoff.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -26910,6 +26911,14 @@ export function heartbeatService(
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
         });
       }
+      // The new assignee's handoff wake may have been parked on this run's
+      // process or lease (MIK-268). Both are gone now; re-admit it.
+      if (latestRun?.runtimeMode === "legacy" && latestRun.status === "cancelled" &&
+          latestRun.errorCode === "issue_reassigned" && !shutdownInProgress) {
+        await readmitReassignmentHandoff(latestRun).catch(err => {
+          logger.error({ err, runId: run.id }, "failed to re-admit reassignment handoff after cleanup");
+        });
+      }
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
@@ -26928,6 +26937,66 @@ export function heartbeatService(
         await startNextQueuedRunForAgent(run.agentId);
       }
     }
+  }
+
+  // See services/reassignment-handoff.ts (MIK-268).
+  async function readmitReassignmentHandoff(
+    stoppedRun: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "contextSnapshot">,
+  ) {
+    const issueId = readNonEmptyString(stoppedRun.contextSnapshot?.issueId);
+    if (!issueId) return null;
+    const found = await db.transaction(async (tx) => {
+      // Assignment admission reads the ownership blocker under this lock, so
+      // its parked receipt is either committed now or never written.
+      await tx.execute(sql`select id from issues where id = ${issueId} and company_id = ${stoppedRun.companyId} for update`);
+      const [issue] = await tx.select().from(issues)
+        .where(and(eq(issues.companyId, stoppedRun.companyId), eq(issues.id, issueId)));
+      if (!issue?.assigneeAgentId || issue.assigneeUserId || issue.assigneeAgentId === stoppedRun.agentId ||
+          !["todo", "in_progress", "in_review"].includes(issue.status)) return null;
+      const assigneeAgentId = issue.assigneeAgentId;
+      const parked = (await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId),
+        eq(agentWakeupRequests.agentId, assigneeAgentId),
+        inArray(agentWakeupRequests.status, ["deferred_issue_execution", "skipped"]),
+        isNull(agentWakeupRequests.runId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+        sql`${agentWakeupRequests.payload}->>'interruptedRunId' = ${stoppedRun.id}`,
+      )).orderBy(desc(agentWakeupRequests.requestedAt)).limit(10))
+        .find((wake) => isParkedReassignmentHandoff(wake, stoppedRun.id));
+      if (!parked) return null;
+      // Any run of the new assignee on this task since the handoff already delivered it.
+      const [later] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, issue.companyId),
+        eq(heartbeatRuns.agentId, assigneeAgentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+        or(
+          gte(heartbeatRuns.createdAt, parked.requestedAt),
+          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+        ),
+      )).limit(1);
+      return later ? null : { issue, assigneeAgentId, parked };
+    });
+    if (!found) return null;
+    const { issue, assigneeAgentId, parked } = found;
+    // A real recovery hold, or a process that outlived cleanup, keeps the wake parked.
+    if (await getExecutionBlocker(db, issue.companyId, issue.id)) {
+      logger.warn({ issueId: issue.id, wakeId: parked.id, runId: stoppedRun.id },
+        "reassignment handoff still blocked after cleanup");
+      return null;
+    }
+    const newRun = await enqueueWakeup(assigneeAgentId, reassignmentHandoffWakeup(parked, issue.id));
+    if (newRun && parked.status === "deferred_issue_execution") {
+      await db.update(agentWakeupRequests)
+        .set({ status: "coalesced", runId: newRun.id, finishedAt: new Date(), updatedAt: new Date() })
+        .where(and(
+          eq(agentWakeupRequests.id, parked.id),
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+    }
+    logger.info({ issueId: issue.id, wakeId: parked.id, stoppedRunId: stoppedRun.id, runId: newRun?.id ?? null },
+      "re-admitted reassignment handoff after cleanup");
+    return newRun;
   }
 
   async function releaseIssueExecutionAndPromote(
@@ -30408,6 +30477,7 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    readmitReassignmentHandoff,
 
     scheduleBoundedRetry: async (
       runId: string,
