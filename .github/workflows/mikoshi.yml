@@ -1,0 +1,158 @@
+# CI and release for the mikoshi fork branch. Upstream's own workflows run on
+# pull requests to paperclipai/paperclip and on its AWS runners; this one runs
+# the server checks on GitHub-hosted runners for every push to `mikoshi`.
+#
+# Release: run this workflow manually with `release` set to the version, e.g.
+# 2026.1012.0-mikoshi.1. The tag is created by GITHUB_TOKEN, so it does not
+# trigger upstream's tag workflows (docker.yml).
+name: Mikoshi
+
+on:
+  push:
+    branches: [mikoshi]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release version to publish as a GitHub release (e.g. 2026.1012.0-mikoshi.1); empty for CI only"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mikoshi-${{ github.ref }}-${{ inputs.release || 'ci' }}
+  cancel-in-progress: false
+
+jobs:
+  typecheck:
+    name: Server typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      - name: Typecheck server
+        run: pnpm --filter @paperclipai/server typecheck
+
+  server-tests:
+    name: Server tests (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "server 1/8", group: general-server-without-chat, shard_index: 0, shard_count: 8 }
+          - { label: "server 2/8", group: general-server-without-chat, shard_index: 1, shard_count: 8 }
+          - { label: "server 3/8", group: general-server-without-chat, shard_index: 2, shard_count: 8 }
+          - { label: "server 4/8", group: general-server-without-chat, shard_index: 3, shard_count: 8 }
+          - { label: "server 5/8", group: general-server-without-chat, shard_index: 4, shard_count: 8 }
+          - { label: "server 6/8", group: general-server-without-chat, shard_index: 5, shard_count: 8 }
+          - { label: "server 7/8", group: general-server-without-chat, shard_index: 6, shard_count: 8 }
+          - { label: "server 8/8", group: general-server-without-chat, shard_index: 7, shard_count: 8 }
+          - { label: "chat 1/2", group: general-chat, shard_index: 0, shard_count: 2 }
+          - { label: "chat 2/2", group: general-chat, shard_index: 1, shard_count: 2 }
+          - { label: "native runner", group: general-server-native-runner }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      - name: Run server tests
+        run: |
+          if [ -n "${{ matrix.shard_count }}" ]; then
+            pnpm test:run:general -- --group '${{ matrix.group }}' \
+              --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+          else
+            pnpm test:run:general -- --group '${{ matrix.group }}'
+          fi
+
+  package:
+    name: Build release tarballs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      - name: Build tarballs
+        env:
+          VERSION: ${{ inputs.release }}
+        run: |
+          if [ -z "$VERSION" ]; then
+            # CI build: version it after the newest upstream release notes.
+            base="$(ls releases/v*.md | sort -V | tail -1)"
+            base="${base#releases/v}"
+            VERSION="${base%.md}-mikoshi.0"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          ./scripts/mikoshi-release.sh "$VERSION" release-out
+      - name: Smoke-install the CLI tarball with the local server tarball
+        run: |
+          prefix="$RUNNER_TEMP/prefix"
+          # The CLI pins the server by release URL, which does not exist
+          # before the release; point it at the local server tarball.
+          cli_dir="$RUNNER_TEMP/cli"
+          mkdir -p "$cli_dir" && tar -xzf "release-out/paperclipai-$VERSION.tgz" -C "$cli_dir"
+          node -e '
+            const fs = require("node:fs");
+            const [file, tgz] = process.argv.slice(1);
+            const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+            pkg.dependencies["@paperclipai/server"] = "file:" + tgz;
+            fs.writeFileSync(file, JSON.stringify(pkg, null, 2));
+          ' "$cli_dir/package/package.json" "$PWD/release-out/paperclipai-server-$VERSION.tgz"
+          # A directory install would only symlink it; repack so npm installs dependencies.
+          (cd "$cli_dir/package" && npm pack --ignore-scripts --pack-destination "$cli_dir" >/dev/null)
+          npm install -g --prefix "$prefix" "$cli_dir/paperclipai-$VERSION.tgz"
+          test "$("$prefix/bin/paperclipai" --version)" = "$VERSION"
+          node -e "import('$prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/server/dist/services/heartbeat.js').then(m => console.log('heartbeat exports', Object.keys(m).length))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mikoshi-release-${{ env.VERSION }}
+          path: release-out/
+
+  release:
+    name: Publish GitHub release
+    if: ${{ inputs.release != '' }}
+    needs: [typecheck, server-tests, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mikoshi-release-${{ inputs.release }}
+          path: release-out
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release }}
+        run: |
+          notes="releases/mikoshi/v$VERSION.md"
+          test -f "$notes" || { echo "missing release notes $notes" >&2; exit 1; }
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" \
+            --notes-file "$notes" --prerelease \
+            "release-out/paperclipai-$VERSION.tgz" \
+            "release-out/paperclipai-server-$VERSION.tgz" \
+            release-out/SHA256SUMS
