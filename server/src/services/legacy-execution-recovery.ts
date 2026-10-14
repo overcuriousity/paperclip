@@ -17,7 +17,7 @@ export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
@@ -43,6 +43,12 @@ export function legacyExecutionNeedsReconciliation(
       evidence?.kind === "ai_connection_wait" && evidence.providerWorkStarted === false) return false;
   if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
       evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
+  // The claim-time gate cancelled this run before it started, because an
+  // earlier run still held the issue (MIK-30). It never reached a provider, so
+  // there are no action outcomes to reconcile. A hold here turns a transient
+  // lease wait into a permanent board-only replay block.
+  if (run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
+      run.resultJson?.timeoutSource === "stale_queued_run_gate" && !run.startedAt) return false;
   // Setup owns the bounded retry budget for temporary workspace scans. Its
   // exhaustion needs workspace repair, not reconciliation of provider actions
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.

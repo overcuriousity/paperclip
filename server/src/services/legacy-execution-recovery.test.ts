@@ -107,3 +107,16 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
 });
+
+it("does not hold a run the claim-time gate cancelled before it started (MIK-30)", () => {
+  const gated = { runtimeMode: "legacy", status: "cancelled", errorCode: "execution_reconciliation_required", startedAt: null,
+    resultJson: { stopReason: "execution_reconciliation_required", timeoutSource: "stale_queued_run_gate",
+      executionWait: { reason: "execution_recovery" } } };
+  expect(legacyExecutionNeedsReconciliation(gated)).toBe(false);
+  // A run the gate stopped after it started may have reached the provider.
+  expect(legacyExecutionNeedsReconciliation({ ...gated, startedAt: new Date() })).toBe(true);
+  // Other cancellations and other sources keep their hold.
+  expect(legacyExecutionNeedsReconciliation({ ...gated, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...gated, resultJson: { stopReason: "execution_reconciliation_required" } })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...gated, status: "failed" })).toBe(true);
+});
