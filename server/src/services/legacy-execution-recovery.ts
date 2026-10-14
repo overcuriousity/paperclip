@@ -15,9 +15,12 @@ import { issueService } from "./issues.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+/** Queue-side cancel codes a run can carry without ever having started. */
+const NEVER_STARTED_CANCEL_CODES = new Set(["issue_assignee_changed", "issue_dependencies_blocked", "issue_terminal_status"]);
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt" | "processPid">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
@@ -49,6 +52,17 @@ export function legacyExecutionNeedsReconciliation(
   // lease wait into a permanent board-only replay block.
   if (run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
       run.resultJson?.timeoutSource === "stale_queued_run_gate" && !run.startedAt) return false;
+  // The queue cancelled this run before it started (reassigned, blocked by a
+  // dependency, or the issue closed), or the stale queued-run gate did (MIK-288).
+  // No process ran and no provider was reached, so there are no action outcomes
+  // to reconcile. A hold here strands the next review handoff to this agent on
+  // a board-only replay block. A pre-dispatch review wait is the exception:
+  // its row can predate launch or lease evidence, so it is cleared only by
+  // isPreDispatchReviewWaitVerified.
+  if (run.status === "cancelled" && !run.startedAt && !run.processPid &&
+      (NEVER_STARTED_CANCEL_CODES.has(run.errorCode ?? "") ||
+        (run.resultJson?.timeoutSource === "stale_queued_run_gate" &&
+          run.errorCode !== "issue_continuation_waiting_on_review"))) return false;
   // Setup owns the bounded retry budget for temporary workspace scans. Its
   // exhaustion needs workspace repair, not reconciliation of provider actions
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.

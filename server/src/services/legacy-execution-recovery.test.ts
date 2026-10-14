@@ -115,8 +115,52 @@ it("does not hold a run the claim-time gate cancelled before it started (MIK-30)
   expect(legacyExecutionNeedsReconciliation(gated)).toBe(false);
   // A run the gate stopped after it started may have reached the provider.
   expect(legacyExecutionNeedsReconciliation({ ...gated, startedAt: new Date() })).toBe(true);
-  // Other cancellations and other sources keep their hold.
-  expect(legacyExecutionNeedsReconciliation({ ...gated, errorCode: "cancelled" })).toBe(true);
+  // Since MIK-288 any never-started gate cancel is exempt; other cancellations
+  // from other sources keep their hold.
+  expect(legacyExecutionNeedsReconciliation({ ...gated, errorCode: "cancelled" })).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...gated, errorCode: "cancelled", resultJson: {} })).toBe(true);
   expect(legacyExecutionNeedsReconciliation({ ...gated, resultJson: { stopReason: "execution_reconciliation_required" } })).toBe(true);
   expect(legacyExecutionNeedsReconciliation({ ...gated, status: "failed" })).toBe(true);
+});
+
+// Run 80de193d (MIK-252): cancelled 30 ms after queueing on reassignment, never
+// started, then picked by the recovery sweep as the review participant's latest run.
+const mik252 = () => ({
+  runtimeMode: "legacy", status: "cancelled", errorCode: "issue_assignee_changed", startedAt: null, processPid: null,
+  resultJson: { stopReason: "issue_assignee_changed", timeoutFired: false, timeoutSource: "stale_queued_run_gate",
+    timeoutConfigured: false, effectiveTimeoutSec: 0 },
+});
+
+it("does not hold a never-started run cancelled on reassignment (MIK-288, run of MIK-252)", () => {
+  expect(legacyExecutionNeedsReconciliation(mik252())).toBe(false);
+});
+
+it.each(["issue_dependencies_blocked", "issue_terminal_status"])("does not hold a never-started run cancelled with %s (MIK-288)", (errorCode) => {
+  expect(legacyExecutionNeedsReconciliation({ ...mik252(), errorCode, resultJson: {} })).toBe(false);
+});
+
+it("does not hold any never-started run the stale queued-run gate cancelled (MIK-288)", () => {
+  expect(legacyExecutionNeedsReconciliation({ ...mik252(), errorCode: "something_new" })).toBe(false);
+});
+
+it("holds a cancelled run that started (MIK-288)", () => {
+  const started = { ...mik252(), startedAt: new Date("2026-10-14T08:00:00Z"), processPid: 4242 };
+  expect(legacyExecutionNeedsReconciliation(started)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...started, processPid: null })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...mik252(), processPid: 4242 })).toBe(true);
+});
+
+it("holds a never-started cancel with an unrelated code and no gate source (MIK-288)", () => {
+  expect(legacyExecutionNeedsReconciliation({ ...mik252(), errorCode: "cancelled_by_operator", resultJson: {} })).toBe(true);
+});
+
+it("still exempts the MIK-30 claim-time gate cancel alongside MIK-288", () => {
+  expect(legacyExecutionNeedsReconciliation({ ...mik252(), errorCode: "execution_reconciliation_required" })).toBe(false);
+});
+
+it("leaves failed runs to the existing rules (MIK-288)", () => {
+  const failed = { ...mik252(), status: "failed", errorCode: "adapter_failed",
+    startedAt: new Date("2026-10-14T08:00:00Z"), processPid: 4242, resultJson: {} };
+  expect(legacyExecutionNeedsReconciliation(failed)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...failed, errorCode: "issue_assignee_changed", startedAt: null, processPid: null })).toBe(true);
 });
