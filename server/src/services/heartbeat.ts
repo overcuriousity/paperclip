@@ -31,7 +31,7 @@ import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
-import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
+import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease, isLegacyControllerLeaseLoss } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
@@ -25476,9 +25476,22 @@ export function heartbeatService(
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
+        // The lease watcher aborts the adapter when this server cannot renew its
+        // 60 s controller lease, e.g. after an event-loop or database stall
+        // (MIK-137). That is a server-side process loss, not a user Stop.
+        // Recording it as "cancelled" left no continuation metadata, so
+        // legacyExecutionNeedsReconciliation() created a board-only replay hold
+        // and the issue was parked "blocked" with no wake. Record it as a failed
+        // run with a continuation and a bounded retry, the same way the graceful
+        // shutdown drain treats a run it stops.
+        let controllerLeaseLost = false;
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
           outcome = latestRun.status;
+        } else if (executionControl.controller.signal.aborted &&
+            isLegacyControllerLeaseLoss(executionControl.controller.signal)) {
+          controllerLeaseLost = true;
+          outcome = "failed";
         } else if (executionControl.controller.signal.aborted) {
           outcome = "cancelled";
         } else if (adapterResult.nativeFinalization) {
@@ -25537,15 +25550,17 @@ export function heartbeatService(
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
-          outcome === "timed_out"
-            ? "timeout"
-            : outcome === "cancelled"
-              ? (latestRun?.errorCode ?? "cancelled")
-              : outcome === "failed"
-                ? (adapterResult.errorCode ??
-                  recordedResponsibleUserDenialCode ??
-                  "adapter_failed")
-                : null;
+          controllerLeaseLost
+            ? "controller_lease_lost"
+            : outcome === "timed_out"
+              ? "timeout"
+              : outcome === "cancelled"
+                ? (latestRun?.errorCode ?? "cancelled")
+                : outcome === "failed"
+                  ? (adapterResult.errorCode ??
+                    recordedResponsibleUserDenialCode ??
+                    "adapter_failed")
+                  : null;
 
         let logSummary: {
           bytes: number | null;
@@ -25948,6 +25963,9 @@ export function heartbeatService(
                 },
               });
             }
+          } else if (controllerLeaseLost) {
+            // Retry like a run the shutdown drain stopped (MIK-137).
+            await enqueueProcessLossRetry(livenessRun, agent, new Date());
           } else if (
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
