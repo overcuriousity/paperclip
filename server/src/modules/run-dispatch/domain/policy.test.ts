@@ -475,6 +475,41 @@ describe("decideQueuedRunStaleness", () => {
     };
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
   });
+
+  describe("pending interaction addressee wake", () => {
+    // MIK-725: the card's creator owns the issue; agent-1 is the addressee.
+    const addresseeFacts = (): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      issueExecutionRunId: null,
+      wakeReason: "interaction_pending",
+      isAddresseeInteractionWake: true,
+    });
+
+    it("lets the addressee of a pending card run on another agent's issue", () => {
+      expect(decideQueuedRunStaleness(addresseeFacts(), NOW)).toEqual({ stale: false });
+    });
+
+    it("lets the addressee run while another agent is the review participant", () => {
+      expect(decideQueuedRunStaleness({
+        ...addresseeFacts(),
+        issueStatus: "in_review",
+        reviewParticipant: {
+          isInReview: true,
+          hasParticipant: true,
+          participantIsAgent: true,
+          participantAgentId: "agent-3",
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "agent-3" },
+        },
+      }, NOW)).toEqual({ stale: false });
+    });
+
+    it("cancels the same wake once the adapter no longer verifies the card", () => {
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), isAddresseeInteractionWake: false }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    });
+  });
 });
 
 describe("native replacement execution authority", () => {

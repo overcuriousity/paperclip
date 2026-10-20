@@ -581,6 +581,30 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    // A card's addressee is woken with interaction_pending and no comment id,
+    // so allowsIssueInteractionWake rejects it and the ownership gate would
+    // cancel the run as issue_assignee_changed. Excuse it only while the card
+    // it names is still pending, on this issue, and addressed to this agent.
+    const pendingInteractionId = issue && wakeReason === "interaction_pending"
+      ? readNonEmptyString(context.interactionId)
+      : null;
+    const isAddresseeInteractionWake = issue && pendingInteractionId
+      ? await dbOrTx
+          .select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.id, pendingInteractionId),
+              eq(issueThreadInteractions.companyId, input.companyId),
+              eq(issueThreadInteractions.issueId, issue.id),
+              eq(issueThreadInteractions.status, "pending"),
+              eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+            ),
+          )
+          .limit(1)
+          .then((rows) => Boolean(rows[0]))
+      : false;
+
     const retryReasonKind = classifyRetryReasonKind(retryReason);
     // Dependency edges can change after scheduled promotion without changing
     // the displayed status. Read them again under the queued/final issue lock.
@@ -605,6 +629,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isAddresseeInteractionWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,

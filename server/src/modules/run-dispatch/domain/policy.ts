@@ -146,6 +146,13 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /**
+   * An interaction_pending wake whose card is still pending on this issue and
+   * addressed to the run's agent. Excuses ownership and the review participant
+   * without widening isInteractionWake, which also gates the comment-wake
+   * AI-connection exception.
+   */
+  isAddresseeInteractionWake?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -565,7 +572,7 @@ export function decideQueuedRunStaleness(
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
-    isInteractionWake: facts.isInteractionWake,
+    isInteractionWake: facts.isInteractionWake || facts.isAddresseeInteractionWake === true,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
@@ -661,7 +668,7 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent,
+    bypass: facts.wakeCommentIdPresent || facts.isAddresseeInteractionWake === true,
   });
   if (participantOutcome === "participant_changed") {
     return {
