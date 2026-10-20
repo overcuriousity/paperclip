@@ -5073,6 +5073,11 @@ async function lastActivityStatsForIssues(
   return [...byIssueId.values()];
 }
 
+/** The blocker ids PATCH /issues/:id echoes, sorted; [] when nothing blocks. */
+function blockedByIssueIdsOf(blockedBy: IssueRelationIssueSummary[] | undefined): string[] {
+  return (blockedBy ?? []).map((blocker) => blocker.id).sort();
+}
+
 async function blockedByMapForIssues(
   dbOrTx: any,
   companyId: string,
@@ -6453,6 +6458,7 @@ async function listBlockedInboxIssues(
             row,
           ),
           blockedBy: blockedByMap.get(row.id) ?? [],
+          blockedByIssueIds: blockedByIssueIdsOf(blockedByMap.get(row.id)),
           lastActivityAt,
           ...(blockerAttentionByIssueId.has(row.id)
             ? { blockerAttention: blockerAttentionByIssueId.get(row.id) }
@@ -8138,9 +8144,8 @@ export function issueService(db: Db) {
         contextUserId
           ? inboxArchiveRowsForIssues(db, companyId, contextUserId, issueIds)
           : Promise.resolve([]),
-        includeBlockedBy
-          ? blockedByMapForIssues(db, companyId, issueIds)
-          : Promise.resolve(new Map<string, IssueRelationIssueSummary[]>()),
+        // Always loaded (one batched query) so every row carries blockedByIssueIds.
+        blockedByMapForIssues(db, companyId, issueIds),
         includeLiveDescendantSummary
           ? liveDescendantCountMapForIssues(db, companyId, issueIds)
           : Promise.resolve(new Map<string, number>()),
@@ -8180,6 +8185,7 @@ export function issueService(db: Db) {
             ...(includeBlockedBy
               ? { blockedBy: blockedByMap.get(row.id) ?? [] }
               : {}),
+            blockedByIssueIds: blockedByIssueIdsOf(blockedByMap.get(row.id)),
             lastActivityAt,
             ...(blockerAttentionByIssueId.has(row.id)
               ? { blockerAttention: blockerAttentionByIssueId.get(row.id) }
@@ -8223,6 +8229,7 @@ export function issueService(db: Db) {
           ...(includeBlockedBy
             ? { blockedBy: blockedByMap.get(row.id) ?? [] }
             : {}),
+          blockedByIssueIds: blockedByIssueIdsOf(blockedByMap.get(row.id)),
           lastActivityAt,
           ...(blockerAttentionByIssueId.has(row.id)
             ? { blockerAttention: blockerAttentionByIssueId.get(row.id) }

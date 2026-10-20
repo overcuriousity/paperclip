@@ -8908,6 +8908,8 @@ export function issueRoutes(
       scheduledRetry,
       activeRecoveryAction: revalidatedActiveRecoveryAction,
       blockedBy: relationsWithRecoveryActions.blockedBy,
+      // The key PATCH echoes, so a read does not return null for it.
+      blockedByIssueIds: relationsWithRecoveryActions.blockedBy.map((blocker) => blocker.id).sort(),
       blocks: relationsWithRecoveryActions.blocks,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map(
