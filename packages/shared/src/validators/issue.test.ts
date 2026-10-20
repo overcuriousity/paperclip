@@ -453,6 +453,42 @@ describe("issue validators", () => {
     expect(document.body).toBe("# Plan\n\nShip it");
   });
 
+  // MIK-743: a body that already has real line breaks was not double-escaped,
+  // so its literal backslash escapes are content (shell blocks) and must survive.
+  const multilineBodyWithLiteralEscapes = [
+    "# Runbook",
+    "",
+    "```bash",
+    "printf '%s\\n' x",
+    "echo 'a\\r\\nb\\rc' && cd C:\\new",
+    "```",
+    "",
+  ].join("\n");
+
+  it("keeps literal backslash escapes in multi-line document bodies (MIK-743)", () => {
+    const document = upsertIssueDocumentSchema.parse({
+      format: "markdown",
+      body: multilineBodyWithLiteralEscapes,
+    });
+
+    expect(document.body).toBe(multilineBodyWithLiteralEscapes);
+
+    const crlfBody = multilineBodyWithLiteralEscapes.replaceAll("\n", "\r\n");
+    expect(upsertIssueDocumentSchema.parse({ format: "markdown", body: crlfBody }).body).toBe(crlfBody);
+  });
+
+  it("keeps literal backslash escapes in multi-line comment bodies (MIK-743)", () => {
+    const comment = addIssueCommentSchema.parse({ body: multilineBodyWithLiteralEscapes });
+    const update = updateIssueSchema.parse({ comment: multilineBodyWithLiteralEscapes });
+
+    expect(comment.body).toBe(multilineBodyWithLiteralEscapes);
+    expect(update.comment).toBe(multilineBodyWithLiteralEscapes);
+  });
+
+  it("still converts a single-line body with literal escapes (MIK-743)", () => {
+    expect(addIssueCommentSchema.parse({ body: "printf '%s\\n' x" }).body).toBe("printf '%s\n' x");
+  });
+
   it("clamps oversized requestDepth values on create", () => {
     const parsed = createIssueSchema.parse({
       title: "Clamp request depth",
