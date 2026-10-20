@@ -164,3 +164,25 @@ it("leaves failed runs to the existing rules (MIK-288)", () => {
   expect(legacyExecutionNeedsReconciliation(failed)).toBe(true);
   expect(legacyExecutionNeedsReconciliation({ ...failed, errorCode: "issue_assignee_changed", startedAt: null, processPid: null })).toBe(true);
 });
+
+// Run 78f38052 (MIK-574, Head, 2026-10-19): a disposition repair the dispatch
+// gate cancelled after the claim and before adapter.execute (MIK-684).
+const mik574Repair = () => ({
+  runtimeMode: "legacy", status: "cancelled", errorCode: "legacy_disposition_repair_suppressed",
+  startedAt: new Date("2026-10-19T11:46:37.253Z"), processPid: null, processGroupId: null,
+  resultJson: { cancellation: { reason: "Execution stopped without a recorded cancellation." } },
+});
+
+it("does not hold a disposition repair the dispatch gate suppressed (MIK-684, run of MIK-574)", () => {
+  expect(legacyExecutionNeedsReconciliation(mik574Repair())).toBe(false);
+});
+
+it("holds a suppressed repair that has process evidence (MIK-684)", () => {
+  expect(legacyExecutionNeedsReconciliation({ ...mik574Repair(), processPid: 4242 })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...mik574Repair(), processGroupId: 4242 })).toBe(true);
+});
+
+it("holds other started cancellations and failed repairs (MIK-684)", () => {
+  expect(legacyExecutionNeedsReconciliation({ ...mik574Repair(), errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...mik574Repair(), status: "failed" })).toBe(true);
+});

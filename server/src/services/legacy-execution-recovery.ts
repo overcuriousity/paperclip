@@ -20,7 +20,7 @@ const NEVER_STARTED_CANCEL_CODES = new Set(["issue_assignee_changed", "issue_dep
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt" | "processPid">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt" | "processPid" | "processGroupId">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
@@ -63,6 +63,14 @@ export function legacyExecutionNeedsReconciliation(
       (NEVER_STARTED_CANCEL_CODES.has(run.errorCode ?? "") ||
         (run.resultJson?.timeoutSource === "stale_queued_run_gate" &&
           run.errorCode !== "issue_continuation_waiting_on_review"))) return false;
+  // The dispatch gate stopped this disposition-repair run because the turn it
+  // was repairing had already recorded a disposition (MIK-684). The gate runs
+  // after the claim (so startedAt is set) but before adapter.execute: only this
+  // gate sets the code, and nothing was spawned. There are no action outcomes to
+  // reconcile. A hold here defers every later wake on the issue, including
+  // accepted cards and board comments, with no run left to promote them.
+  if (run.status === "cancelled" && run.errorCode === "legacy_disposition_repair_suppressed" &&
+      !run.processPid && !run.processGroupId) return false;
   // Setup owns the bounded retry budget for temporary workspace scans. Its
   // exhaustion needs workspace repair, not reconciliation of provider actions
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
