@@ -25,7 +25,7 @@ import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
 import { isBrowserUseConnection } from "./browser-use-client.js";
-import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
+import { queuedInteractionId, readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
@@ -10489,7 +10489,7 @@ export function heartbeatService(
         let wait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
         const admitted = await admitExplicitNativeContinuation({ db, companyId: run.companyId, issueId,
           agentId: run.agentId, actorType: wake.requestedByActorType, actorId: requestedByActorId,
-          reason, commentId, successorRunId: randomUUID(), dryRun: true,
+          reason, commentId, successorRunId: randomUUID(), dryRun: true, interactionId: queuedInteractionId(payload),
           ...((run.runtimeMode === "native" || cancelledPreparation) ? { queuedCommentRequestId: wake.id } : {}),
           onBlocked: (reason, message) => { wait = { reason, message }; },
         });
@@ -28063,6 +28063,7 @@ export function heartbeatService(
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
+            interactionId: queuedInteractionId(payload),
             dryRun: true,
             onBlocked: (reason, message) => { continuationWait = { reason, message }; },
           }))) return deferBlockedExecution(executionBlocker);
@@ -28829,6 +28830,7 @@ export function heartbeatService(
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
+            interactionId: queuedInteractionId(payload),
           });
           if (!explicitContinuation && executionBlocker) return deferBlockedExecution(executionBlocker);
           if (explicitContinuation) {

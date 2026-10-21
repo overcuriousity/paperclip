@@ -391,10 +391,17 @@ export async function buildExecutionContinuation(input: {
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
         input.runId ? eq(agentWakeupRequests.runId, input.runId) : undefined,
       )) : [];
+    // A card answer admitted as the user's message (MIK-859): its resolver must
+    // still be that user, a person, and the card must still be resolved.
+    const decisionId = string(explicitContinuation.interactionId);
     const authorization = continuationAuthorizations.find(value => failedRunId
           ? value.failedRunId === failedRunId && retryWakes.some(wake =>
               wake.runId === value.runId && wake.requestedByActorId === value.actorId &&
               priorRuns.some(run => run.id === wake.runId && run.retryOfRunId === failedRunId))
+          : decisionId
+          ? value.interactionId === decisionId && !value.queuedCommentInterruptId && interactions.some(row =>
+              row.id === decisionId && ["accepted", "answered", "rejected"].includes(row.status) &&
+              row.resolvedByUserId === value.actorId && !row.resolvedByAgentId && !row.resolvedByRunId)
           : rows.some(comment => comment.id === value.commentId &&
               comment.authorType === "user" &&
               (!("commentUpdatedAt" in value || "commentBodyHash" in value || value.automaticRetry) || (

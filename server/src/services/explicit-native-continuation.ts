@@ -7,7 +7,7 @@ import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession } from "
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
-import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import {
   agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
   environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
@@ -79,20 +79,34 @@ export async function admitExplicitNativeContinuation(input: {
   queuedCommentInterruptId?: string;
   /** Internal delivery of an unconsumed, user-authored saved queue entry. */
   queuedCommentRequestId?: string;
+  /** A resolved card on this issue; admitted only if its resolver is this user (MIK-859). */
+  interactionId?: string | null;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
-}): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string } | null> {
+}): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; interactionId?: string } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
   const blocked = (reason: string, message: string) => { input.onBlocked?.(reason, message); return null; };
   if (input.actorType !== "user" || !actorId) return null;
   const retry = input.reason === "retry_failed_run" &&
     z.string().guid().safeParse(input.failedRunId).success;
-  if (!retry && !input.queuedCommentInterruptId && (!commentId || !z.string().guid().safeParse(commentId).success ||
-      !["issue_commented", "issue_reopened_via_comment"].includes(input.reason ?? ""))) return null;
+  const decisionId = !retry && !input.queuedCommentInterruptId && !input.queuedCommentRequestId &&
+    input.reason === "issue_commented" && z.string().guid().safeParse(input.interactionId).success ? input.interactionId! : null;
+  const commentRequest = Boolean(commentId && z.string().guid().safeParse(commentId).success &&
+    ["issue_commented", "issue_reopened_via_comment"].includes(input.reason ?? ""));
+  if (!retry && !input.queuedCommentInterruptId && !decisionId && !commentRequest) return null;
   const [task] = await db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   ));
   if (!task || task.assigneeAgentId !== agentId || ["done", "cancelled"].includes(task.status)) return null;
+  // A card answer is a user decision with no comment of its own. Like a comment,
+  // it must be this user's own, made by a person and not by an agent or a run.
+  const [decision] = decisionId ? await db.select().from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, companyId), eq(issueThreadInteractions.issueId, issueId),
+    eq(issueThreadInteractions.id, decisionId), inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"]),
+    eq(issueThreadInteractions.resolvedByUserId, actorId), isNull(issueThreadInteractions.resolvedByAgentId),
+    isNull(issueThreadInteractions.resolvedByRunId), isNotNull(issueThreadInteractions.resolvedAt),
+  )) : [];
+  if (decisionId && !decision && !commentRequest) return null;
   const [interruptQueue] = input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -124,14 +138,14 @@ export async function admitExplicitNativeContinuation(input: {
     if (undelivered.at(-1) !== commentId) return null;
     partiallyDeliveredQueue = undelivered.length !== ids.length;
   }
-  const [comment] = retry || response ? [] : await db.select().from(issueComments).where(and(
+  const [comment] = retry || response || decision ? [] : await db.select().from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     eq(issueComments.id, commentId!), eq(issueComments.authorType, "user"),
     queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId), isNull(issueComments.createdByRunId),
     isNull(issueComments.deletedAt),
   ));
-  if (!retry && !response && !comment?.body.trim()) return null;
-  const authorizedAt = response?.comment.createdAt ?? comment?.createdAt ?? new Date();
+  if (!retry && !response && !decision && !comment?.body.trim()) return null;
+  const authorizedAt = response?.comment.createdAt ?? decision?.resolvedAt ?? comment?.createdAt ?? new Date();
   const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
   if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
   if (queuedInterrupt && !isConversationAdapter(agent.adapterType) && !response?.source.requiresFreshSession) return null;
@@ -282,7 +296,8 @@ export async function admitExplicitNativeContinuation(input: {
   await buildExecutionContinuation({ db, companyId, issueId, agentId,
     context: { previousRunId: previous.id, wakeCommentId: commentId },
     summary: null, exposeLowTrustRaw: false });
-  if (input.dryRun) return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };
+  const decided = decision ? { interactionId: decision.id } : {};
+  if (input.dryRun) return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}), ...decided };
   for (const stopped of stoppedSessions) {
     if (!stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");
     await appendHeartbeatRunEvent(db, {
@@ -292,7 +307,7 @@ export async function admitExplicitNativeContinuation(input: {
       payload: stopped.evidence,
     });
   }
-  const authorization = { actorId, commentId, ...(response ? { interactionId: response.source.interactionId } : {}), ...(retry ? { failedRunId: input.failedRunId } : {}),
+  const authorization = { actorId, commentId, ...(response ? { interactionId: response.source.interactionId } : {}), ...decided, ...(retry ? { failedRunId: input.failedRunId } : {}),
     ...(comment ? { commentUpdatedAt: comment.updatedAt.toISOString(),
       commentBodyHash: createHash("sha256").update(comment.body).digest("hex") } : {}),
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId } : {}),
@@ -330,7 +345,7 @@ export async function admitExplicitNativeContinuation(input: {
     details: { continuation: retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
       recoveryActionIds: actions.map(action => action.id), previousRunIds: sources.map(run => run.id) },
   });
-  return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };
+  return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}), ...decided };
 }
 
 /** Re-admit a bounded automatic retry without lending it its parent's receipt.
