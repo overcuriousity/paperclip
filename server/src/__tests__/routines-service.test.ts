@@ -2163,6 +2163,58 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues).toHaveLength(0);
   });
 
+  it("always_enqueue dispatches while the previous issue is still open and execution-locked (MIK-952)", async () => {
+    // The default fixture wakeup stamps executionRunId on the new issue, the same
+    // lock write that hit issues_open_routine_execution_uq (23505) in production.
+    const { routine, svc } = await seedFixture();
+    await svc.update(routine.id, { concurrencyPolicy: "always_enqueue" }, {});
+
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(first.status).toBe("issue_created");
+    const [firstIssue] = await db
+      .select({ status: issues.status, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, first.linkedIssueId!));
+    expect(firstIssue).toMatchObject({ status: "todo" });
+    expect(firstIssue?.executionRunId).toBeTruthy();
+
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(second.failureReason).toBeNull();
+    expect(second.status).toBe("issue_created");
+    expect(second.linkedIssueId).toBeTruthy();
+    expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+
+    const routineIssues = await db
+      .select({ originFingerprint: issues.originFingerprint, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(2);
+    expect(routineIssues.every((issue) => issue.executionRunId)).toBe(true);
+    expect(new Set(routineIssues.map((issue) => issue.originFingerprint)).size).toBe(2);
+  });
+
+  it("keeps the Postgres cause of a dispatch failure in failureReason (MIK-952)", async () => {
+    const pgError = Object.assign(new Error("duplicate key value violates unique constraint \"issues_open_routine_execution_uq\""), {
+      code: "23505",
+      constraint_name: "issues_open_routine_execution_uq",
+      detail: "Key (company_id, origin_kind, origin_id, origin_fingerprint)=(c, routine_execution, r, f) already exists.",
+    });
+    const { routine, svc } = await seedFixture({
+      wakeup: async () => {
+        throw new Error("Failed query: update \"issues\" set \"execution_run_id\" = $1", { cause: pgError });
+      },
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+
+    expect(run.status).toBe("failed");
+    expect(run.linkedIssueId).toBeNull();
+    expect(run.failureReason).toContain("Failed query: update");
+    expect(run.failureReason).toContain("cause: 23505");
+    expect(run.failureReason).toContain("constraint issues_open_routine_execution_uq");
+    expect(run.failureReason).toContain("already exists.");
+  });
+
   it("accepts standard second-precision webhook timestamps for HMAC triggers", async () => {
     const { routine, svc } = await seedFixture();
     const { trigger, secretMaterial } = await svc.createTrigger(

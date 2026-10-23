@@ -516,6 +516,25 @@ function normalizeRoutineDispatchFingerprintValue(value: unknown): unknown {
   return String(value);
 }
 
+// A dispatch failure is stored as `failureReason` and was never logged. For a
+// query error that is only drizzle's "Failed query: <sql> params: ..." wrapper;
+// the Postgres error (code, constraint, detail) sits in `cause` and was lost
+// (MIK-952). Append it so the routine run explains itself from the API.
+export function describeRoutineDispatchFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+  if (!cause || typeof cause !== "object") return message;
+  const fields = cause as Record<string, unknown>;
+  const text = (key: string) => (typeof fields[key] === "string" && fields[key] ? (fields[key] as string) : null);
+  const parts = [
+    text("code"),
+    cause instanceof Error ? cause.message : text("message"),
+    text("constraint_name") ? `constraint ${text("constraint_name")}` : null,
+    text("detail"),
+  ].filter((part): part is string => part !== null);
+  return parts.length ? `${message}\ncause: ${parts.join("; ")}` : message;
+}
+
 function createRoutineDispatchFingerprint(input: {
   payload: Record<string, unknown> | null;
   projectId: string | null;
@@ -1931,7 +1950,15 @@ export function routineService(
             originKind: issueOriginKind,
             originId: issueOriginId,
             originRunId: createdRun.id,
-            originFingerprint: dispatchFingerprint,
+            // always_enqueue never coalesces, so its issues must not share a key in
+            // issues_open_routine_execution_uq (one open, execution-locked issue per
+            // fingerprint). With a shared fingerprint, an issue whose predecessor is
+            // still open and running fails with 23505 when its execution lock is
+            // stamped, and the dispatch is lost (MIK-952: a daily routine whose
+            // previous issue was still in progress).
+            originFingerprint: input.routine.concurrencyPolicy === "always_enqueue"
+              ? `${dispatchFingerprint}:run:${createdRun.id}`
+              : dispatchFingerprint,
             billingCode: issueBillingCode,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
@@ -2007,7 +2034,11 @@ export function routineService(
         if (createdIssue) {
           await txDb.delete(issues).where(eq(issues.id, createdIssue.id));
         }
-        const failureReason = error instanceof Error ? error.message : String(error);
+        const failureReason = describeRoutineDispatchFailure(error);
+        logger.warn(
+          { err: error, routineId: input.routine.id, routineRunId: createdRun.id },
+          "routine dispatch failed",
+        );
         const failed = await finalizeRun(createdRun.id, {
           status: "failed",
           failureReason,
